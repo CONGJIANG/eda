@@ -18,19 +18,6 @@
 
 
 
-This function creates man/count_classes.Rd in {eda}, which is the help we get when typing ?count_classes in the R Console
-Using check() again
-Since we already included LICENSE.md in {eda}, let’s use check() again in the R Console to ensure the license-related warning is gone
-
-install()
-It’s time to install our package {eda}
-That said, instead of using install.packages() as with any package in the CRAN, we will use install() from {devtools}
-Note that install() installs a local package in the current working directory, whereas install.packages() installs from a package repository
-install()
-library(eda)
-count_classes(mtcars, cyl)
-
-41 / 54
 
 
 count_classes <- function(data_frame, class_col) {
