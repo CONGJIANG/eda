@@ -1,0 +1,485 @@
+# Load necessary libraries
+library(dplyr)
+library(randomForest)
+library(nnet)
+library(earth)
+require("dplyr") # to use select function
+require("sandwich")
+require("haven")
+require("sas7bdat")
+require("hal9001")
+
+element_glm <- function(TNDdf_train, ps_model, out_model1, out_model2) {
+  # Data splitting
+  s <- sample(1:nrow(TNDdf_train), nrow(TNDdf_train) / 2)
+  TNDdf_train1 <- TNDdf_train[s,]
+  TNDdf_train2 <- TNDdf_train[-s,]
+  
+  TNDdf_train_ctr1 <- subset(TNDdf_train1, Y==0)
+  TNDdf_train_ctr2 <- subset(TNDdf_train2, Y==0)
+  # Training glm models for the treatment effect
+  mod_g1_ctr <- glm(ps_model, data = subset(TNDdf_train_ctr1, select = -Y), family = binomial())
+  mod_g2_ctr <- glm(ps_model, data = subset(TNDdf_train_ctr2, select = -Y), family = binomial())
+  
+  g1_cont <- TNDdf_train$V
+  g1_cont[-s] <- predict(mod_g1_ctr, newdata = as.data.frame(cbind(select(TNDdf_train2, -c(V, Y)), V = rep(1, nrow(TNDdf_train2)), Y = TNDdf_train2$Y)), type = "response")
+  g1_cont[s] <- predict(mod_g2_ctr, newdata = as.data.frame(cbind(select(TNDdf_train1, -c(V, Y)), V = rep(1, nrow(TNDdf_train1)), Y = TNDdf_train1$Y)), type = "response")
+  
+  # Training glm models for the outcome
+  Out_mu1 <- glm(out_model1, data = TNDdf_train1, family = binomial())
+  Out_mu2 <- glm(out_model1, data = TNDdf_train2, family = binomial())
+  
+  mu1 <- TNDdf_train$Y
+  mu0 <- TNDdf_train$Y
+  
+  mu1[-s] <- predict(Out_mu1, newdata = as.data.frame(cbind(V = 1, select(TNDdf_train2, -c(V, Y)))), type = "response")
+  mu1[s] <- predict(Out_mu2, newdata = as.data.frame(cbind(V = 1, select(TNDdf_train1, -c(V, Y)))), type = "response")
+  
+  mu0[-s] <- predict(Out_mu1, newdata = as.data.frame(cbind(V = 0, select(TNDdf_train2, -c(V, Y)))), type = "response")
+  mu0[s] <- predict(Out_mu2, newdata = as.data.frame(cbind(V = 0, select(TNDdf_train1, -c(V, Y)))), type = "response")
+  
+  # Training glm models for m0
+  Out_m1 <- glm(out_model2, data = subset(TNDdf_train1, select = -V), family = binomial)
+  Out_m2 <- glm(out_model2, data = subset(TNDdf_train2, select = -V), family = binomial)
+  
+  m0 <- TNDdf_train$Y
+  m0[-s] <- 1 - predict(Out_m1, newdata = select(TNDdf_train2, -c(V, Y)), type = "response")
+  m0[s] <- 1 - predict(Out_m2, newdata = select(TNDdf_train1, -c(V, Y)), type = "response")
+  
+  summary(Out_m1)
+  mu1 <- pmin(pmax(mu1, 0.001), 0.999)
+  mu0 <- pmin(pmax(mu0, 0.001), 0.999)
+  m0 <- pmin(pmax(m0, 0.001), 0.999)
+  g1 <- pmin(pmax(g1_cont, 0.001), 0.999)
+  g0 <- 1 - pmin(pmax(g1_cont, 0.001), 0.999)
+  
+  return(list(mu1 = mu1, mu0 = mu0, m0 = m0, g1 = g1,g0 = g0, w1 = m0 / (1 - mu1),w0 = m0 / (1 - mu0)))
+}
+
+
+
+
+######## Methods for VE
+### IPW estimator
+mod_IPW <- function(TNDdat, res){
+  TNDdat$ipw <- ifelse(TNDdat$V == 1, 1/res$g1, 1/res$g0)
+  modY.ipw <- glm(Y ~ V, family=binomial(link = "logit"), weights = ipw, data=TNDdat)
+  est.ipw <- exp(modY.ipw$coefficients[2])
+  se.ipw <- sqrt(vcovHC(modY.ipw)[2,2])
+  
+  CI_l <- est.ipw *exp(- 1.96 * se.ipw )
+  CI_u <- est.ipw *exp( 1.96 * se.ipw )
+  return(list(est = est.ipw, se = se.ipw, CI =  c(CI_l, CI_u)))
+}
+
+mod_IPW1GLM <- function(TNDdat, res, bootstrap_CI = TRUE, ps_model, out_model1, out_model2){
+  IPW.est <- mean(TNDdat$Y*TNDdat$V/res$g1)/mean(TNDdat$Y*(1-TNDdat$V)/res$g0)
+  if (bootstrap_CI) {
+    nbs <- 50
+    bsest <- rep(NA, nbs)
+    
+    for(i in 1:nbs){
+      resamps <- sample(1:nrow(TNDdat), size = nrow(TNDdat), replace = TRUE)
+      datk <- TNDdat[resamps,]
+      res <- element_glm(datk, ps_model, out_model1, out_model2)
+      bsest[i] <- mean(datk$Y*datk$V/res$g1)/mean(datk$Y*(1-datk$V)/res$g0)
+    }
+    
+    bs_var <- var(bsest)
+    CI <- quantile(bsest, c(0.025, 0.975), na.rm = TRUE)
+  } else {
+    CI <- NA
+  }
+  return(list(est = IPW.est, CI = CI))
+}
+
+
+### EIF based estimator with OUTCOME ratio debiasing weights
+mod_EIF1OUT <- function(TNDdat, res){
+  # proposed eif estimator 1 with Out ratio weights
+  A.1 <- res$w1*res$mu1*((1 - TNDdat$Y)*(TNDdat$V - res$g1))/(res$g1* res$m0)
+  A.0 <- res$w0*res$mu0*((1 - TNDdat$Y)*((1-TNDdat$V) - res$g0))/(res$g0* res$m0)
+  psi.1 <- mean(TNDdat$Y*TNDdat$V/res$g1 - A.1)
+  psi.0 <- mean(TNDdat$Y*(1-TNDdat$V)/res$g0 - A.0)
+  mod_eif <- psi.1/psi.0
+  eifln <-  ((TNDdat$Y*TNDdat$V/res$g1 - A.1)/psi.1) - ((TNDdat$Y*(1-TNDdat$V)/res$g0 - A.0)/ psi.0)
+  varln <-  var(eifln)/nrow(TNDdat)
+  
+  CI_l1 <- exp(log(mod_eif) - 1.96 * sqrt(varln) )
+  CI_u1 <- exp(log(mod_eif) + 1.96 * sqrt(varln) )
+  
+  eifpsi <- (TNDdat$Y*TNDdat$V/res$g1 - A.1)/psi.0 - (psi.1/psi.0)*(TNDdat$Y*(1-TNDdat$V)/res$g0 - A.0)/psi.0
+  var <- var(eifpsi)/nrow(TNDdat)
+  CI_l2 <- mod_eif - 1.96 * sqrt(var)
+  CI_u2 <- mod_eif + 1.96 * sqrt(var)
+  return(list( est = mod_eif, varln = varln, var = var, CI1 =  c(CI_l1, CI_u1), CI2 =  c(CI_l2, CI_u2)))
+}
+
+### EIF based estimator with PS ratio debiasing weights
+mod_EIF1PS <- function(TNDdat, res){
+  # proposed eif estimator 1 with PS ratio weights
+  A.1 <- res$w1.ps*res$mu1*((1 - TNDdat$Y)*(TNDdat$V - res$g1))/(res$g1* res$m0)
+  A.0 <- res$w0.ps*res$mu0*((1 - TNDdat$Y)*((1-TNDdat$V) - res$g0))/(res$g0* res$m0)
+  psi.1 <- mean(TNDdat$Y*TNDdat$V/res$g1 - A.1)
+  psi.0 <- mean(TNDdat$Y*(1-TNDdat$V)/res$g0 - A.0)
+  mod_eif <- psi.1/psi.0
+  eifln <-  ((TNDdat$Y*TNDdat$V/res$g1 - A.1)/psi.1) - ((TNDdat$Y*(1-TNDdat$V)/res$g0 - A.0)/ psi.0)
+  varln <-  var(eifln)/nrow(TNDdat)
+  
+  CI_l1 <- exp(log(mod_eif) - 1.96 * sqrt(varln) )
+  CI_u1 <- exp(log(mod_eif) + 1.96 * sqrt(varln) )
+  
+  eifpsi <- (TNDdat$Y*TNDdat$V/res$g1 - A.1)/psi.0 - (psi.1/psi.0)*(TNDdat$Y*(1-TNDdat$V)/res$g0 - A.0)/psi.0
+  var <- var(eifpsi)/nrow(TNDdat)
+  CI_l2 <- mod_eif - 1.96 * sqrt(var)
+  CI_u2 <- mod_eif + 1.96 * sqrt(var)
+  return(list( est = mod_eif, varln = varln, var = var, CI1 =  c(CI_l1, CI_u1), CI2 =  c(CI_l2, CI_u2)))
+}
+
+#### proposed TNDDR, SAME as eif1OUT
+mod_EIF2 <- function(TNDdat, res){
+  A.1 <- ((1 - TNDdat$Y)*(TNDdat$V - res$g1))/(res$g1* (1 -res$mu1))
+  A.0 <- ((1 - TNDdat$Y)*((1-TNDdat$V) - res$g0))/(res$g0* (1 - res$mu0))
+  psi.1 <- mean(TNDdat$Y*TNDdat$V/res$g1 - res$mu1*A.1)
+  psi.0 <- mean(TNDdat$Y*(1-TNDdat$V)/res$g0 - res$mu0*A.0)
+  mod_eif2 <- psi.1/psi.0
+  eifln <-  ((TNDdat$Y*TNDdat$V/res$g1 - res$mu1*A.1)/psi.1) - ((TNDdat$Y*(1-TNDdat$V)/res$g0 - res$mu0*A.0)/ psi.0)
+  varln <-  var(eifln)/nrow(TNDdat)
+  
+  CI_l1 <- exp(log(mod_eif2) - 1.96 * sqrt(varln) )
+  CI_u1 <- exp(log(mod_eif2) + 1.96 * sqrt(varln) )
+  
+  eifpsi <- (TNDdat$Y*TNDdat$V/res$g1 - res$mu1*A.1)/psi.0 - (psi.1/psi.0)*(TNDdat$Y*(1-TNDdat$V)/res$g0 - res$mu0*A.0)/psi.0
+  var <- var(eifpsi)/nrow(TNDdat)
+  CI_l2 <- mod_eif2 - 1.96 * sqrt(var)
+  CI_u2 <- mod_eif2 + 1.96 * sqrt(var)
+  return(list( est = mod_eif2, varln = varln, var = var, CI1 =  c(CI_l1, CI_u1), CI2 =  c(CI_l2, CI_u2)))
+}
+
+mod_OutRegGLM <- function(TNDdat, res, bootstrap_CI = TRUE, ps_model, out_model1, out_model2){
+  mod_OR1 <- mean(res$mu1 * res$w1) / mean(res$mu0 * res$w0)
+  if (bootstrap_CI) {
+    nbs <- 50
+    bsest <- rep(NA, nbs)
+    
+    for(i in 1:nbs){
+      resamps <- sample(1:nrow(TNDdat), size = nrow(TNDdat), replace = TRUE)
+      datk <- TNDdat[resamps,]
+      res <- element_glm(datk, ps_model, out_model1, out_model2)
+      bsest[i] <- mean(res$mu1 * res$w1) / mean(res$mu0 * res$w0)
+    }
+    bs_var <- var(bsest)
+    CI <- quantile(bsest, c(0.025, 0.975), na.rm = TRUE)
+  } else {
+    CI <- NA
+  }
+  return(list(est = mod_OR1, CI.OR = CI))
+}
+
+
+
+output_dir <- ""
+
+
+TNDresGLM <- function(B = 1000, ssize = 1000, em = 0.25, bootstrap_CI = FALSE, ps_model, out_model1, out_model2) {
+  # Construct the output file name based on the method
+  output_file <- paste0(output_dir, "res_", "GLMWW", ssize, "em_", em, ".txt")
+  # Main loop to run simulations and apply chosen methods
+  for (i in 1:B) {
+    # Generate data
+    TNDdat <- datagen(ssize = ssize, em = em)
+    res <- element_glm(TNDdat, ps_model = ps_model, out_model1 = out_model1, out_model2 = out_model2)
+    
+    
+    # Apply estimation functions and collect results
+    est0 <- mod_IPW(TNDdat, res)
+    est0_val <- est0$est
+    CI0 <- est0$CI
+    
+    est1 <- mod_IPW1GLM(TNDdat, res, bootstrap_CI = TRUE, ps_model, out_model1, out_model2)
+    est1_val <- est1$est
+    CI1 <- est1$CI
+    
+    est2 <- mod_OutRegGLM(TNDdat, res, bootstrap_CI = TRUE, ps_model, out_model1, out_model2)
+    est2_val <- est2$est
+    CI2 <- est2$CI.OR
+    
+    est3 <- mod_EIF2(TNDdat, res)
+    est3_val <- est3$est
+    TNDCI1 <- est3$CI1
+    TNDCI2 <- est3$CI2
+    
+    # Save results
+    write(
+      c(i, est0_val, CI0, est1_val, CI1, est2_val, CI2, est3_val,TNDCI1, TNDCI2),
+      file = output_file,
+      ncolumns = 50,
+      append = TRUE
+    )
+  }
+}
+# C + sin(pi * C)
+# V + C + V * C + cos(pi*C) + exp(C)
+ps_model <- V ~ C
+out_model1 <- Y ~ C + V + V*C 
+out_model2 <- Y ~ C 
+TNDresGLM(B = 300, ssize = 5000, em = 0.25, bootstrap_CI = F, ps_model = ps_model, out_model1 = out_model1, out_model2 = out_model2)
+
+
+# Read and process Random Forest results
+output_file <- "res_GLMPSt1000em_0.txt"
+res_pst <- read.table(output_file, header = FALSE, sep = " ", stringsAsFactors = FALSE)
+res_pst <- na.omit(res_ps)
+colnames(res_pst)[c(1, 2, 5, 8, 11)] <- c("i", "IPW1", "IPW2", "Out", "EIF")
+summary(res_pst, na.rm = FALSE)
+
+output_file <- "res_GLMPSt3000em_0.txt"
+res_ps2 <- read.table(output_file, header = FALSE, sep = " ", stringsAsFactors = FALSE)
+res_ps2 <- na.omit(res_ps2)
+colnames(res_ps2)[c(1, 2, 5, 8, 11)] <- c("i", "IPW1", "IPW2", "Out", "EIF")
+summary(res_ps2, na.rm = FALSE)
+
+output_file <- "res_GLMPSt5000em_0.25.txt"
+res_ps3 <- read.table(output_file, header = FALSE, sep = " ", stringsAsFactors = FALSE)
+res_ps3 <- na.omit(res_ps3)
+colnames(res_ps3)[c(1, 2, 5, 8, 11)] <- c("i", "IPW1", "IPW2", "Out", "EIF")
+summary(res_ps3, na.rm = FALSE)
+
+
+output_file <- "res_GLMBotht1000em_0.txt"
+res_btt <- read.table(output_file, header = FALSE, sep = " ", stringsAsFactors = FALSE)
+res_btt <- na.omit(res_btt)
+colnames(res_btt)[c(1, 2, 5, 8, 11)] <- c("i", "IPW1", "IPW2", "Out", "EIF")
+summary(res_btt, na.rm = FALSE)
+
+output_file <- "res_GLMBotht3000em_0.txt"
+res_btt2 <- read.table(output_file, header = FALSE, sep = " ", stringsAsFactors = FALSE)
+res_btt2 <- na.omit(res_btt2)
+colnames(res_btt2)[c(1, 2, 5, 8, 11)] <- c("i", "IPW1", "IPW2", "Out", "EIF")
+summary(res_btt2, na.rm = FALSE)
+
+
+output_file <- "res_GLMBotht5000em_0.25.txt"
+res_btt3 <- read.table(output_file, header = FALSE, sep = " ", stringsAsFactors = FALSE)
+res_btt3 <- na.omit(res_btt3)
+colnames(res_btt3)[c(1, 2, 5, 8, 11)] <- c("i", "IPW1", "IPW2", "Out", "EIF")
+summary(res_btt3, na.rm = FALSE)
+
+
+output_file <- "res_GLMORt1000em_0.txt"
+res_or <- read.table(output_file, header = FALSE, sep = " ", stringsAsFactors = FALSE)
+res_or <- na.omit(res_or)
+colnames(res_or)[c(1, 2, 5, 8, 11)] <- c("i", "IPW1", "IPW2", "Out", "EIF")
+summary(res_or, na.rm = FALSE)
+
+output_file <- "res_GLMORt3000em_0.txt"
+res_or2 <- read.table(output_file, header = FALSE, sep = " ", stringsAsFactors = FALSE)
+res_or2 <- na.omit(res_or2)
+colnames(res_or2)[c(1, 2, 5, 8, 11)] <- c("i", "IPW1", "IPW2", "Out", "EIF")
+summary(res_or2, na.rm = FALSE)
+
+output_file <- "res_GLMORt5000em_0.25.txt"
+res_or3 <- read.table(output_file, header = FALSE, sep = " ", stringsAsFactors = FALSE)
+res_or3 <- na.omit(res_or3)
+colnames(res_or3)[c(1, 2, 5, 8, 11)] <- c("i", "IPW1", "IPW2", "Out", "EIF")
+summary(res_or3, na.rm = FALSE)
+
+
+output_file <- "res_GLMWW1000em_0.txt"
+res_ww <- read.table(output_file, header = FALSE, sep = " ", stringsAsFactors = FALSE)
+colnames(res_ww)[c(1, 2, 5, 8, 11)] <- c("i", "IPW1", "IPW2", "Out", "EIF")
+summary(res_ww, na.rm = FALSE)
+
+output_file <- "res_GLMWW3000em_0.txt"
+res_ww2 <- read.table(output_file, header = FALSE, sep = " ", stringsAsFactors = FALSE)
+colnames(res_ww2)[c(1, 2, 5, 8, 11)] <- c("i", "IPW1", "IPW2", "Out", "EIF")
+summary(res_ww2, na.rm = FALSE)
+
+output_file <- "res_GLMWW5000em_0.25.txt"
+res_ww3 <- read.table(output_file, header = FALSE, sep = " ", stringsAsFactors = FALSE)
+colnames(res_ww3)[c(1, 2, 5, 8, 11)] <- c("i", "IPW1", "IPW2", "Out", "EIF")
+summary(res_ww3, na.rm = FALSE)
+
+# Define mean relative risk (mRR)
+mRR <-  0.1232571
+
+round(apply(res_or, 2, mean) - mRR, 3)
+round(apply(res_or2, 2, mean) - mRR, 3)
+round(apply(res_or3, 2, mean) - mRR, 3)
+
+round(apply(res_pst, 2, mean) - mRR, 3)
+round(apply(res_ps2, 2, mean) - mRR, 3)
+round(apply(res_ps3, 2, mean) - mRR, 3)
+
+round(apply(res_ww, 2, mean) - mRR, 3)
+round(apply(res_ww2, 2, mean) - mRR, 3)
+round(apply(res_ww3, 2, mean) - mRR, 3)
+
+round(apply(res_btt, 2, mean) - mRR, 3)
+round(apply(res_btt2, 2, mean) - mRR, 3)
+round(apply(res_btt3, 2, mean) - mRR, 3)
+
+
+round(apply(res_or, 2, median) - mRR, 3)
+round(apply(res_or2, 2, median) - mRR, 3)
+round(apply(res_or3, 2, median) - mRR, 3)
+round(apply(res_pst, 2, median) - mRR, 3)
+round(apply(res_ps2, 2, median) - mRR, 3)
+round(apply(res_ps3, 2, median) - mRR, 3)
+round(apply(res_ww, 2, median) - mRR, 3)
+round(apply(res_ww2, 2, median) - mRR, 3)
+round(apply(res_ww3, 2, median) - mRR, 3)
+round(apply(res_btt, 2, median) - mRR, 3)
+round(apply(res_btt2, 2, median) - mRR, 3)
+round(apply(res_btt3, 2, median) - mRR, 3)
+
+# Confidence Intervals
+psi <- mRR
+mean(psi <= res_rf$V4 & psi >= res_rf$V3)
+mean(psi <= res_rf$V9 & psi >= res_rf$V8)
+mean(psi <= res_rf$V12 & psi >= res_rf$V11)
+mean(psi <= res_rf$V15 & psi >= res_rf$V14)
+mean(psi <= res_rf$V17 & psi >= res_rf$V16)
+
+
+
+
+# Integrated TND Data Generation Function
+datagen <- function(ssize = 500, popsize = 15000000, OR_C = 1.5,
+                    OR_W1 = 1, OR_W2 = 1.25, em = 0.25,
+                    cfV0 = FALSE, cfV1 = FALSE, return_full = FALSE, co_inf_para = 0.00001) {
+  # Generate confounders and covariates
+  C <- runif(n = popsize, -3, 3)  # Continuous confounder
+  U1 <- rbinom(n = popsize, size = 1, prob = 0.5)  # Unmeasured binary covariate
+  U2 <- rbinom(n = popsize, size = 1, prob = 0.5)  # Unmeasured binary covariate
+  
+  # Generate Vaccination Status
+  if (cfV0 == TRUE) {
+    V <- rep(0, popsize)
+  } else if (cfV1 == TRUE) {
+    V <- rep(1, popsize)
+  } else {
+    V <- rbinom(n = popsize, size = 1, prob = plogis(0.5 * (1.5 + 1 * C - 2.5 * sin(pi * C))))
+  }
+  
+  # Convert to log-odds for logistic regression
+  bsl_I1 <- qlogis(co_inf_para)
+  bsl_I2 <- qlogis(co_inf_para)
+  
+  # Generate independent infections
+  I1 <- rbinom(n = popsize, size = 1, prob = plogis(0.5 * C + bsl_I1 + 4 * U1))  # Infection with other viruses
+  lambda_covid <- bsl_I2 + 0.15 * C + 0.5 * exp(C) -log(OR_C)*V - em * V * C + log(3) * U2 * (1.5 - V) - 3 * U1
+  I2 <- rbinom(n = popsize, size = 1, prob = plogis(lambda_covid))  # Infection with SARS-CoV-2
+  
+  # Calculate the percentage of co-infections
+  #co_inf <- sum(I1 == 1 & I2 == 1)
+  #per_co_inf <- co_inf / popsize * 100
+  
+  # Generate symptoms W1 and W2
+  W1 <- rep(0, popsize)
+  W1[I1 == 1] <- rbinom(
+    n = sum(I1 == 1),
+    size = 1,
+    prob = plogis(3 + 0.5 * C[I1 == 1] - log(OR_W1) * V[I1 == 1] - 0.5 * U1[I1 == 1])
+  )
+  
+  W2 <- rep(0, popsize)
+  W2[I2 == 1] <- rbinom(
+    n = sum(I2 == 1),
+    size = 1,
+    prob = plogis(-5 + 1 * C[I2 == 1] - log(OR_W2) * V[I2 == 1] - 1 * U1[I2 == 1] + 0.5 * U2[I2 == 1] * (1 - V[I2 == 1]))
+  )
+  
+  # Combine symptoms into a unified status
+  W <- pmax(W1, W2)
+  
+  #hospitalization, only possible if symptoms present
+  H=rep(0,popsize)
+  H[W==1]<-rbinom(prob=plogis(2+0.15*C[W==1] -0.5*U1[W==1]),size=1,n=sum(W==1))
+  #mean(H[W==1]) # with severe symptoms go to hospital
+  
+  # Selection on outcome for testing (hospitalization)
+  R <- sample(which(H == 1), ssize, replace = TRUE)  # Sample randomly from those hospitalized
+  
+  if (return_full == FALSE) {
+    dat <- as.data.frame(cbind(Y = I2, V = V, C = C)[R, ])
+  } else {
+    dat <- as.data.frame(cbind(Infec_COVID = I2, Infec = I1, H = H, W = W, V = V, C = C))
+  }
+  
+  return(dat)
+}
+
+# Example of using the integrated function
+test_data <- datagen(ssize = 1000, em = 0.25)
+head(test_data)
+sum(test_data$Y)/nrow(test_data)
+
+
+rep <- 10
+orvect<-rep(NA,rep)
+for (j in 1:rep){
+  datfull1<-datagen(cfV1=T,return_full=T)
+  datfull0<-datagen(cfV0=T,return_full=T)
+  orvect[j]<-mean(datfull1$H*datfull1$Infec_COVID)/mean(datfull0$H*datfull0$Infec_COVID)
+}
+
+(psi = mean(orvect))
+hist(orvect)
+
+
+
+
+
+
+
+library(geex)
+
+# Define the estimating function based on the system of equations
+my_estfun <- function(data) {
+  Y <- data$Y
+  V <- data$V
+  C <- as.matrix(subset(data, select = -c(Y, V))) # assuming C is a matrix of covariates
+  
+  # Define the estimating function that depends on theta
+  function(theta) {
+    alpha <- theta[1:length(C[1, ])]  # extracting alpha (logistic regression coefficients)
+    psi_v <- theta[length(C[1, ]) + 1]  # psi_v parameter
+    psi_v0 <- theta[length(C[1, ]) + 2]  # psi_v0 parameter
+    psi_mRR <- theta[length(C[1, ]) + 3]  # psi_mRR parameter
+    
+    expit_C_alpha <- 1 / (1 + exp(-C %*% alpha))  # expit(C_i^T * alpha)
+    
+    # The system of equations
+    c(
+      sum((Y == 0) * (V - expit_C_alpha) %*% C),  # First equation
+      sum(q0 * Y * V / expit_C_alpha - psi_v),  # Second equation
+      sum(q0 * Y * (1 - V) / (1 - expit_C_alpha) - psi_v0),  # Third equation
+      (psi_v / psi_v0) - psi_mRR  # Fourth equation
+    )
+  }
+}
+
+# Example data
+set.seed(123)
+n <- 100
+data <- data.frame(
+  Y = rbinom(n, 1, 0.5),      # Binary outcome Y
+  V = rbinom(n, 1, 0.5),      # Binary or continuous variable V
+  C = matrix(rnorm(n * 3), n)  # Matrix of covariates C (3 covariates in this example)
+)
+
+# Define the q0 constant (assumed constant here, adjust as needed)
+q0 <- 1
+
+# Use m_estimate to estimate the parameters
+results <- m_estimate(
+  estFUN = my_estfun,
+  data = data,
+  root_control = setup_root_control(start = c(rep(0, 3), 1, 1, 1))  # starting values for theta (alpha, psi_v, psi_v0, psi_mRR)
+)
+
+
+alpha <- rep(0,3)
+# Check the results
+summary(results)
